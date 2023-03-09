@@ -2,6 +2,7 @@
 
 use aligned_vec::CACHELINE_ALIGN;
 use dyn_stack::{DynStack, ReborrowMut, SizeOverflow, StackReq};
+use serde;
 
 use super::super::math::fft::{FftView, FourierPolynomialList};
 use super::bootstrap::{bootstrap_scratch, FourierLweBootstrapKeyView};
@@ -16,6 +17,7 @@ use crate::core_crypto::commons::parameters::*;
 use crate::core_crypto::commons::traits::*;
 use crate::core_crypto::commons::utils::izip;
 use crate::core_crypto::entities::*;
+use crate::core_crypto::prelude::Fft;
 
 use concrete_fft::c64;
 
@@ -408,6 +410,156 @@ pub struct FourierGgswCiphertextList<C: Container<Element = c64>> {
     decomposition_level_count: DecompositionLevelCount,
     decomposition_base_log: DecompositionBaseLog,
     count: usize,
+}
+
+impl<C: Container<Element = c64>> serde::Serialize for FourierGgswCiphertextList<C> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let fourier = &self.fourier;
+        let glwe_size = self.glwe_size;
+        let decomposition_level_count = self.decomposition_level_count;
+        let decomposition_base_log = self.decomposition_base_log;
+        let count = self.count;
+
+        let data = fourier.data.as_ref();
+        let polynomial_size = fourier.polynomial_size;
+        let chunk_count = if polynomial_size.0 == 0 {
+            0
+        } else {
+            data.len() / (polynomial_size.0 / 2)
+        };
+
+        pub struct SingleFourierPolynomial<'a> {
+            fft: FftView<'a>,
+            buf: &'a [c64],
+        }
+
+        impl<'a> serde::Serialize for SingleFourierPolynomial<'a> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error> {
+                self.fft.serialize_fourier_buffer(serializer, self.buf)
+            }
+        }
+
+        use serde::ser::SerializeSeq;
+        let mut state = serializer.serialize_seq(Some(6 + chunk_count))?;
+        state.serialize_element(&glwe_size)?;
+        state.serialize_element(&decomposition_level_count)?;
+        state.serialize_element(&decomposition_base_log)?;
+        state.serialize_element(&count)?;
+        state.serialize_element(&polynomial_size)?;
+        state.serialize_element(&chunk_count)?;
+        if chunk_count != 0 {
+            let fft = Fft::new(polynomial_size);
+            for buf in data.split_into(chunk_count) {
+                state.serialize_element(&SingleFourierPolynomial {
+                    fft: fft.as_view(),
+                    buf,
+                })?;
+            }
+        }
+        state.end()
+    }
+}
+
+impl<'de, C: IntoContainerOwned<Element = c64>> serde::Deserialize<'de> for FourierGgswCiphertextList<C> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use std::marker::PhantomData;
+        struct SeqVisitor<C: IntoContainerOwned<Element = c64>>(PhantomData<fn() -> C>);
+
+        impl<'de, C: IntoContainerOwned<Element = c64>> serde::de::Visitor<'de> for SeqVisitor<C> {
+            type Value = FourierGgswCiphertextList<C>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(
+                    "a sequence of six fields followed by polynomials in the Fourier domain",
+                )
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let str = "sequence of six fields and Fourier polynomials";
+                let glwe_size = match seq.next_element::<GlweSize>()? {
+                    Some(glwe_size) => glwe_size,
+                    None => return Err(serde::de::Error::invalid_length(0, &str)),
+                };
+                let decomposition_level_count = match seq.next_element::<DecompositionLevelCount>()? {
+                    Some(decomposition_level_count) => decomposition_level_count,
+                    None => return Err(serde::de::Error::invalid_length(1, &str)),
+                };
+                let decomposition_base_log = match seq.next_element::<DecompositionBaseLog>()? {
+                    Some(decomposition_base_log) => decomposition_base_log,
+                    None => return Err(serde::de::Error::invalid_length(2, &str)),
+                };
+                let count = match seq.next_element::<usize>()? {
+                    Some(count) => count,
+                    None => return Err(serde::de::Error::invalid_length(3, &str)),
+                };
+                let polynomial_size = match seq.next_element::<PolynomialSize>()? {
+                    Some(polynomial_size) => polynomial_size,
+                    None => return Err(serde::de::Error::invalid_length(4, &str)),
+                };
+                let chunk_count = match seq.next_element::<usize>()? {
+                    Some(chunk_count) => chunk_count,
+                    None => return Err(serde::de::Error::invalid_length(5, &str)),
+                };
+
+                struct FillFourier<'a> {
+                    fft: FftView<'a>,
+                    buf: &'a mut [c64],
+                }
+
+                impl<'de, 'a> serde::de::DeserializeSeed<'de> for FillFourier<'a> {
+                    type Value = ();
+
+                    fn deserialize<D: serde::Deserializer<'de>>(
+                        self,
+                        deserializer: D,
+                    ) -> Result<Self::Value, D::Error> {
+                        self.fft.deserialize_fourier_buffer(deserializer, self.buf)
+                    }
+                }
+
+                let mut data =
+                    C::collect((0..(polynomial_size.0 / 2 * chunk_count)).map(|_| c64::default()));
+
+                if chunk_count != 0 {
+                    let fft = Fft::new(polynomial_size);
+                    for (i, buf) in data.as_mut().split_into(chunk_count).enumerate() {
+                        match seq.next_element_seed(FillFourier {
+                            fft: fft.as_view(),
+                            buf,
+                        })? {
+                            Some(()) => (),
+                            None => {
+                                return Err(serde::de::Error::invalid_length(
+                                    i,
+                                    &&*format!("sequence of {chunk_count} Fourier polynomials"),
+                                ))
+                            }
+                        };
+                    }
+                }
+
+                let fourier = FourierPolynomialList {
+                    data,
+                    polynomial_size,
+                };
+                Ok(FourierGgswCiphertextList {
+                    fourier,
+                    glwe_size,
+                    decomposition_level_count,
+                    decomposition_base_log,
+                    count,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(SeqVisitor::<C>(PhantomData))
+    }
 }
 
 pub type FourierGgswCiphertextListView<'a> = FourierGgswCiphertextList<&'a [c64]>;
