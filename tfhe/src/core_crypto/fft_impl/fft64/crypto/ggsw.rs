@@ -305,7 +305,8 @@ impl FourierGgswCiphertext<ABox<[c64]>> {
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "C: IntoContainerOwned"))]
 pub struct FourierGgswCiphertextList<C: Container<Element = c64>> {
     fourier: FourierPolynomialList<C>,
     glwe_size: GlweSize,
